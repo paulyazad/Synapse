@@ -1,56 +1,60 @@
 """
 Synapse — Flask API
-Wraps soc_analyst.py (v4.1) and exposes endpoints consumed by the Next.js frontend.
-
+===================
 Endpoints:
-  POST /api/triage          — full ticket triage (priority, MITRE, VT, playbook)
-  GET  /api/health          — liveness + model status
-  GET  /api/stats           — live stats from prediction log
-  GET  /api/recent          — last N predictions from log
+  POST /api/triage   — full ticket triage (priority, MITRE, VT, playbook)
+  GET  /api/health   — liveness + model status
+  GET  /api/stats    — aggregate stats from prediction log
+  GET  /api/recent   — last N predictions from log
 
-Run:
-  cd synapse/api
-  python app.py
+Deployment:
+  Local  : python app.py
+  Render : set Start Command to "python app.py"
+           PORT env var is set automatically by Render
 """
 
-import os, sys, re, csv, json, time, importlib
-from datetime import datetime, timedelta
+import os, re, csv, time
+from datetime import datetime
 from pathlib import Path
-from typing import Optional
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 
 app = Flask(__name__)
-CORS(app, origins=["http://localhost:3000", "http://localhost:3001"])
 
-# ── Model bundle (lazy-loaded on first request) ───────────────────────────────
+# ── CORS: allow localhost dev + any Vercel deployment ──────────────────────────
+CORS(app, origins=[
+    "http://localhost:3000",
+    "http://localhost:3001",
+    r"https://.*\.vercel\.app",     # all Vercel preview URLs
+    os.environ.get("FRONTEND_URL", ""),  # explicit production URL if set
+], supports_credentials=False)
+
+# ── Model path — searches multiple locations so it works locally AND on Render ─
+def _find_model() -> Path:
+    candidates = [
+        Path(__file__).parent / "soc_models_v4.pkl",           # api/soc_models_v4.pkl  ← put it here
+        Path(__file__).parent.parent / "soc_models_v4.pkl",    # repo root
+        Path(__file__).parent.parent.parent / "soc_models_v4.pkl",
+        Path(os.environ.get("MODEL_PATH", "soc_models_v4.pkl")),
+    ]
+    for c in candidates:
+        if c.exists():
+            return c
+    return candidates[0]  # return first candidate so error message is useful
+
+MODEL_PKL  = _find_model()
+LOG_CSV    = MODEL_PKL.parent / "prediction_log_v4.csv"
+VT_API_KEY = os.environ.get("VT_API_KEY", "")
+
+# ── Lazy model bundle ──────────────────────────────────────────────────────────
 _bundle   = None
-_model_ok = False
 _load_err = ""
 
-# ── Paths — adjust to wherever your files live ────────────────────────────────
-BASE_DIR    = Path(__file__).parent.parent.parent   # project root
-MODEL_PKL   = BASE_DIR / "soc_models_v4.pkl"
-LOG_CSV     = BASE_DIR / "prediction_log_v4.csv"
-VT_API_KEY  = os.environ.get("VT_API_KEY", "0ac743e119615a7b933daad4f6dcaf7e7772ca523e96fafbf99a6dab263b91a2")
-
-# ─────────────────────────────────────────────────────────────────────────────
-# INLINE ML ENGINE
-# Reproduces the core logic from soc_analyst.py without the training phase.
-# The trained model (soc_models_v4.pkl) must be present.
-# ─────────────────────────────────────────────────────────────────────────────
 import numpy as np
-import pandas as pd
 import joblib
 import requests as _requests
 
 PRIORITY_INV = {0: "Low", 1: "Medium", 2: "High"}
-MITRE_CORE   = {
-    "Reconnaissance", "Initial Access", "Execution", "Persistence",
-    "Privilege Escalation", "Defense Evasion", "Credential Access",
-    "Discovery", "Lateral Movement", "Collection", "Exfiltration",
-    "Command and Control", "Impact",
-}
 
 HEURISTICS_KEYWORDS = [
     "ransomware", "encrypted files", "shadow copy", "vssadmin", "wbadmin delete",
@@ -167,24 +171,34 @@ DEFAULT_PLAYBOOK = [
     "Document findings in the incident management platform.",
 ]
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# HELPERS
+# ─────────────────────────────────────────────────────────────────────────────
+
 def _get_playbook(tags):
     for t in tags:
         if t in PLAYBOOKS:
             return PLAYBOOKS[t]
     return DEFAULT_PLAYBOOK
 
+
 def _heuristic_priority(ticket_name, description, threat_desc=""):
     combined = f"{ticket_name} {description} {threat_desc}"
     return 2 if _HIGH_PAT.search(combined) else None
 
+
 def _extract_iocs(text):
-    all_ips    = list(dict.fromkeys(_IP_RE.findall(text)))
-    public_ips = [ip for ip in all_ips if not PRIVATE_IP_RE.match(ip)]
-    private_ips= [ip for ip in all_ips if PRIVATE_IP_RE.match(ip)]
-    raw_domains= [m.group(1).lower() for m in _URL_RE.finditer(text)
-                  if m.group(1) and len(m.group(1)) > 4 and not _SKIP_TOKENS.search(m.group(1))]
-    domains    = list(dict.fromkeys(d for d in raw_domains if not INTERNAL_DOMAIN_RE.search(d)))
+    all_ips     = list(dict.fromkeys(_IP_RE.findall(text)))
+    public_ips  = [ip for ip in all_ips if not PRIVATE_IP_RE.match(ip)]
+    private_ips = [ip for ip in all_ips if PRIVATE_IP_RE.match(ip)]
+    raw_domains = [
+        m.group(1).lower() for m in _URL_RE.finditer(text)
+        if m.group(1) and len(m.group(1)) > 4 and not _SKIP_TOKENS.search(m.group(1))
+    ]
+    domains = list(dict.fromkeys(d for d in raw_domains if not INTERNAL_DOMAIN_RE.search(d)))
     return {"public_ips": public_ips, "private_ips": private_ips, "domains_urls": domains}
+
 
 def _vt_lookup_ip(ip, api_key):
     try:
@@ -198,17 +212,22 @@ def _vt_lookup_ip(ip, api_key):
         s = a.get("last_analysis_stats", {})
         return {
             "ioc": ip, "type": "ip", "error": None,
-            "status":     "malicious" if s.get("malicious",0)>0 else ("suspicious" if s.get("suspicious",0)>0 else "clean"),
-            "malicious":  s.get("malicious",0),  "suspicious": s.get("suspicious",0),
-            "harmless":   s.get("harmless",0),
-            "country":    a.get("country","—"),   "asn": str(a.get("asn","—")),
-            "owner":      a.get("as_owner","—"),  "reputation": a.get("reputation",0),
-            "tags":       a.get("tags",[]),
+            "status":   "malicious" if s.get("malicious", 0) > 0 else (
+                        "suspicious" if s.get("suspicious", 0) > 0 else "clean"),
+            "malicious":  s.get("malicious", 0),
+            "suspicious": s.get("suspicious", 0),
+            "harmless":   s.get("harmless", 0),
+            "country":    a.get("country", "—"),
+            "asn":        str(a.get("asn", "—")),
+            "owner":      a.get("as_owner", "—"),
+            "reputation": a.get("reputation", 0),
+            "tags":       a.get("tags", []),
             "last_analysis": datetime.utcfromtimestamp(a["last_analysis_date"]).strftime("%Y-%m-%d")
                              if "last_analysis_date" in a else "—",
         }
     except Exception as e:
         return {"ioc": ip, "type": "ip", "error": str(e)}
+
 
 def _vt_lookup_domain(domain, api_key):
     try:
@@ -220,71 +239,97 @@ def _vt_lookup_domain(domain, api_key):
             return {"ioc": domain, "type": "domain", "error": f"HTTP {r.status_code}"}
         a = r.json()["data"]["attributes"]
         s = a.get("last_analysis_stats", {})
-        cats = list(set(a.get("categories",{}).values()))[:4]
+        cats = list(set(a.get("categories", {}).values()))[:4]
         return {
             "ioc": domain, "type": "domain", "error": None,
-            "status":    "malicious" if s.get("malicious",0)>0 else ("suspicious" if s.get("suspicious",0)>0 else "clean"),
-            "malicious": s.get("malicious",0), "suspicious": s.get("suspicious",0),
-            "harmless":  s.get("harmless",0),
-            "categories": cats, "reputation": a.get("reputation",0),
-            "registrar":  a.get("registrar","—"),
+            "status":    "malicious" if s.get("malicious", 0) > 0 else (
+                         "suspicious" if s.get("suspicious", 0) > 0 else "clean"),
+            "malicious":  s.get("malicious", 0),
+            "suspicious": s.get("suspicious", 0),
+            "harmless":   s.get("harmless", 0),
+            "categories": cats,
+            "reputation": a.get("reputation", 0),
+            "registrar":  a.get("registrar", "—"),
             "last_analysis": datetime.utcfromtimestamp(a["last_analysis_date"]).strftime("%Y-%m-%d")
                              if "last_analysis_date" in a else "—",
         }
     except Exception as e:
         return {"ioc": domain, "type": "domain", "error": str(e)}
 
+
 def _load_models():
-    global _bundle, _model_ok, _load_err
+    global _bundle, _load_err
     if _bundle:
         return True
     if not MODEL_PKL.exists():
-        _load_err = f"Model file not found: {MODEL_PKL}. Run soc_analyst.py first to train."
+        _load_err = (
+            f"Model file not found: {MODEL_PKL}. "
+            f"Run soc_analyst.py to train, then copy soc_models_v4.pkl into the api/ folder."
+        )
         return False
     try:
         _bundle = joblib.load(str(MODEL_PKL))
-        _model_ok = True
         return True
     except Exception as e:
         _load_err = str(e)
         return False
 
+
 def _explain(text, enc, model_a, top_n=5):
-    tokens    = text.lower().split()
-    if not tokens: return []
-    base_conf = float(model_a.predict_proba_max(enc.transform([text]))[0])
-    imps = []
-    for i, tok in enumerate(tokens):
-        ablated = " ".join(t for j, t in enumerate(tokens) if j != i)
-        conf    = float(model_a.predict_proba_max(enc.transform([ablated]))[0])
-        imps.append({"token": tok, "delta": round(base_conf - conf, 4)})
-    imps.sort(key=lambda x: -abs(x["delta"]))
-    return imps[:top_n]
+    tokens = text.lower().split()
+    if not tokens:
+        return []
+    try:
+        base_conf = float(model_a.predict_proba_max(enc.transform([text]))[0])
+        imps = []
+        for i, tok in enumerate(tokens):
+            ablated = " ".join(t for j, t in enumerate(tokens) if j != i)
+            conf = float(model_a.predict_proba_max(enc.transform([ablated]))[0])
+            imps.append({"token": tok, "delta": round(base_conf - conf, 4)})
+        imps.sort(key=lambda x: -abs(x["delta"]))
+        return imps[:top_n]
+    except Exception:
+        return []
+
 
 def _log_prediction(data):
     exists = LOG_CSV.exists()
-    with open(LOG_CSV, "a", newline="") as f:
-        w = csv.DictWriter(f, fieldnames=[
-            "timestamp","ticket_name","description_snippet",
-            "predicted_priority","predicted_mitre","confidence",
-            "vt_verdict","analyst_override",
-        ])
-        if not exists: w.writeheader()
-        w.writerow(data)
+    try:
+        with open(LOG_CSV, "a", newline="") as f:
+            w = csv.DictWriter(f, fieldnames=[
+                "timestamp", "ticket_name", "description_snippet",
+                "predicted_priority", "predicted_mitre", "confidence",
+                "vt_verdict", "analyst_override",
+            ])
+            if not exists:
+                w.writeheader()
+            w.writerow(data)
+    except Exception:
+        pass  # don't crash the API if logging fails
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # ROUTES
 # ─────────────────────────────────────────────────────────────────────────────
 
+@app.route("/")
+def index():
+    return jsonify({
+        "service": "Synapse SOC API",
+        "version": "1.0",
+        "endpoints": ["/api/health", "/api/triage", "/api/stats", "/api/recent"],
+    })
+
+
 @app.route("/api/health")
 def health():
     ok = _load_models()
     return jsonify({
-        "status":    "ok" if ok else "degraded",
-        "model_ok":  ok,
+        "status":     "ok" if ok else "degraded",
+        "model_ok":   ok,
         "model_path": str(MODEL_PKL),
-        "error":     _load_err if not ok else None,
-        "timestamp": datetime.utcnow().isoformat(),
+        "error":      _load_err if not ok else None,
+        "timestamp":  datetime.utcnow().isoformat(),
     }), 200 if ok else 503
 
 
@@ -304,7 +349,6 @@ def triage():
     if not ticket_name:
         return jsonify({"error": "ticket_name is required"}), 400
 
-    # ── Load models ──────────────────────────────────────────────────────────
     if not _load_models():
         return jsonify({"error": _load_err}), 503
 
@@ -312,28 +356,31 @@ def triage():
     m_a = _bundle["model_a"]
     m_b = _bundle["model_b"]
 
-    # ── Priority ─────────────────────────────────────────────────────────────
+    # Priority
     heuristic = _heuristic_priority(ticket_name, description, threat_desc)
     combined  = f"{ticket_name} {description} {threat_desc}".lower().strip()
     feat      = enc.transform([combined])
     ml_pri    = int(m_a.predict(feat)[0])
     final_pri = max(heuristic if heuristic is not None else ml_pri, ml_pri)
-    confidence= float(m_a.predict_proba_max(feat)[0])
+    confidence = float(m_a.predict_proba_max(feat)[0])
     if heuristic == 2:
         confidence = max(confidence, 0.90)
     auto_dispatch = confidence >= 0.60
 
-    # ── MITRE ────────────────────────────────────────────────────────────────
+    # MITRE
     mitre_raw  = m_b.predict(feat)[0]
     mitre_tags = list(mitre_raw) if mitre_raw else ["Unknown"]
     playbook   = _get_playbook(mitre_tags)
 
-    # ── Explainability ────────────────────────────────────────────────────────
+    # Explainability
     top_tokens = _explain(combined, enc, m_a)
 
-    # ── IOC extraction ────────────────────────────────────────────────────────
-    all_text = " ".join(filter(None, [ticket_name, description, threat_desc, source_ip, dest_ip, affected_hostname]))
-    iocs     = _extract_iocs(all_text)
+    # IOC extraction
+    all_text = " ".join(filter(None, [
+        ticket_name, description, threat_desc,
+        source_ip, dest_ip, affected_hostname,
+    ]))
+    iocs = _extract_iocs(all_text)
     if dest_ip and not PRIVATE_IP_RE.match(dest_ip) and dest_ip not in iocs["public_ips"]:
         iocs["public_ips"].insert(0, dest_ip)
     if source_ip and PRIVATE_IP_RE.match(source_ip) and source_ip not in iocs["private_ips"]:
@@ -343,7 +390,7 @@ def triage():
         if h and not INTERNAL_DOMAIN_RE.search(h) and h not in iocs["domains_urls"]:
             iocs["domains_urls"].insert(0, h)
 
-    # ── VT enrichment ─────────────────────────────────────────────────────────
+    # VT enrichment
     enrichment = {
         "verdict": "NO_IOCS", "ip_results": [], "domain_results": [],
         "summary": "VirusTotal enrichment not requested.",
@@ -372,22 +419,22 @@ def triage():
             "verdict":        verdict,
             "ip_results":     ip_results,
             "domain_results": domain_results,
-            "summary":        f"{len(ip_results)} IPs + {len(domain_results)} domains analysed",
+            "summary":        f"{len(ip_results)} IP(s) + {len(domain_results)} domain(s) analysed",
         }
     elif run_vt and not vt_key:
         enrichment["summary"] = "VT API key not configured. Set VT_API_KEY env variable."
         enrichment["verdict"] = "UNKNOWN"
 
-    # ── Log ───────────────────────────────────────────────────────────────────
+    # Log
     _log_prediction({
-        "timestamp":            datetime.utcnow().isoformat(),
-        "ticket_name":          ticket_name,
-        "description_snippet":  description[:120],
-        "predicted_priority":   PRIORITY_INV[final_pri],
-        "predicted_mitre":      "|".join(mitre_tags),
-        "confidence":           round(confidence, 3),
-        "vt_verdict":           enrichment["verdict"],
-        "analyst_override":     "",
+        "timestamp":           datetime.utcnow().isoformat(),
+        "ticket_name":         ticket_name,
+        "description_snippet": description[:120],
+        "predicted_priority":  PRIORITY_INV[final_pri],
+        "predicted_mitre":     "|".join(mitre_tags),
+        "confidence":          round(confidence, 3),
+        "vt_verdict":          enrichment["verdict"],
+        "analyst_override":    "",
     })
 
     return jsonify({
@@ -408,26 +455,22 @@ def triage():
 def stats():
     if not LOG_CSV.exists():
         return jsonify({"total": 0, "by_priority": {}, "by_verdict": {}, "auto_rate": 0})
-    rows = []
     with open(LOG_CSV) as f:
         rows = list(csv.DictReader(f))
     if not rows:
         return jsonify({"total": 0, "by_priority": {}, "by_verdict": {}, "auto_rate": 0})
-
-    by_pri  = {}
-    by_verd = {}
+    by_pri, by_verd = {}, {}
     for r in rows:
-        p = r.get("predicted_priority","Unknown")
-        v = r.get("vt_verdict","UNKNOWN")
+        p = r.get("predicted_priority", "Unknown")
+        v = r.get("vt_verdict", "UNKNOWN")
         by_pri[p]  = by_pri.get(p, 0)  + 1
         by_verd[v] = by_verd.get(v, 0) + 1
-
-    high_conf = sum(1 for r in rows if float(r.get("confidence",0)) >= 0.6)
+    high_conf = sum(1 for r in rows if float(r.get("confidence", 0)) >= 0.6)
     return jsonify({
-        "total":       len(rows),
-        "by_priority": by_pri,
-        "by_verdict":  by_verd,
-        "auto_rate":   round(high_conf / len(rows), 3) if rows else 0,
+        "total":        len(rows),
+        "by_priority":  by_pri,
+        "by_verdict":   by_verd,
+        "auto_rate":    round(high_conf / len(rows), 3) if rows else 0,
         "last_updated": rows[-1]["timestamp"] if rows else None,
     })
 
@@ -442,7 +485,14 @@ def recent():
     return jsonify(rows[-n:][::-1])
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# ENTRY POINT
+# ─────────────────────────────────────────────────────────────────────────────
+
 if __name__ == "__main__":
-    print("Synapse API starting on http://localhost:5050")
+    port = int(os.environ.get("PORT", 5050))   # Render sets PORT automatically
+    print(f"Synapse API starting on http://0.0.0.0:{port}")
+    print(f"Model path: {MODEL_PKL}")
+    print(f"Model found: {MODEL_PKL.exists()}")
     _load_models()
-    app.run(host="0.0.0.0", port=5050, debug=False)
+    app.run(host="0.0.0.0", port=port, debug=False)
