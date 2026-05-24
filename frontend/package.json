@@ -1,0 +1,28 @@
+{
+  "name": "synapse-frontend",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "dev":   "cross-env NODE_OPTIONS=--max-old-space-size=512 next dev --turbo=false",
+    "build": "next build",
+    "start": "next start",
+    "lint":  "next lint"
+  },
+  "dependencies": {
+    "next":      "14.2.29",
+    "react":     "18.3.1",
+    "react-dom": "18.3.1"
+  },
+  "devDependencies": {
+    "@types/node":      "^20",
+    "@types/react":     "^18",
+    "@types/react-dom": "^18",
+    "autoprefixer":     "^10.4.21",
+    "cross-env":        "^7.0.3",
+    "eslint":           "^8",
+    "eslint-config-next":"14.2.29",
+    "postcss":          "8.4.31",
+    "tailwindcss":      "^3.4.19",
+    "typescript":       "^5"
+  }
+}
