@@ -1,16 +1,16 @@
 """
-Synapse — Flask API
-===================
-Endpoints:
-  POST /api/triage   — full ticket triage (priority, MITRE, VT, playbook)
-  GET  /api/health   — liveness + model status
-  GET  /api/stats    — aggregate stats from prediction log
-  GET  /api/recent   — last N predictions from log
+Synapse — Flask API v2
+======================
+Fixed: embeds StackedTfidfEncoder, TwoStagePriorityClassifier, and
+MultiLabelMITREClassifier directly so joblib can deserialise the .pkl
+on Render without needing soc_analyst.py present.
 
-Deployment:
-  Local  : python app.py
-  Render : set Start Command to "python app.py"
-           PORT env var is set automatically by Render
+Endpoints:
+  GET  /             — service info
+  GET  /api/health   — liveness + model status
+  POST /api/triage   — full triage
+  GET  /api/stats    — aggregate stats
+  GET  /api/recent   — last N predictions
 """
 
 import os, re, csv, time
@@ -19,41 +19,141 @@ from pathlib import Path
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 
-app = Flask(__name__)
+# ── Core ML / numeric imports ─────────────────────────────────────────────────
+import numpy as np
+import joblib
+import requests as _requests
+from scipy.sparse import hstack
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.decomposition import TruncatedSVD
+from sklearn.preprocessing import MultiLabelBinarizer
+from sklearn.multiclass import OneVsRestClassifier
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.svm import LinearSVC
+from sklearn.calibration import CalibratedClassifierCV
 
-# ── CORS: allow localhost dev + any Vercel deployment ──────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# CUSTOM CLASSES — must be defined here so joblib.load() can unpickle the .pkl
+# These are copied verbatim from soc_analyst.py
+# ─────────────────────────────────────────────────────────────────────────────
+
+class StackedTfidfEncoder:
+    def __init__(self, n_lsa=120):
+        self.word_vec = TfidfVectorizer(
+            ngram_range=(1, 2), max_features=6000,
+            sublinear_tf=True, min_df=2, analyzer="word")
+        self.char_vec = TfidfVectorizer(
+            ngram_range=(3, 6), max_features=4000,
+            sublinear_tf=True, min_df=3, analyzer="char_wb")
+        self.lsa = TruncatedSVD(n_components=n_lsa, random_state=42)
+
+    def fit_transform(self, texts):
+        W = self.word_vec.fit_transform(texts)
+        C = self.char_vec.fit_transform(texts)
+        return self.lsa.fit_transform(hstack([W, C]))
+
+    def transform(self, texts):
+        W = self.word_vec.transform(texts)
+        C = self.char_vec.transform(texts)
+        return self.lsa.transform(hstack([W, C]))
+
+
+class TwoStagePriorityClassifier:
+    def __init__(self):
+        self.stage1 = CalibratedClassifierCV(
+            LinearSVC(class_weight="balanced", max_iter=3000, C=0.8),
+            cv=3, method="sigmoid")
+        self.stage2 = CalibratedClassifierCV(
+            RandomForestClassifier(
+                n_estimators=300, class_weight="balanced",
+                max_depth=15, random_state=42, n_jobs=1),
+            cv=3, method="sigmoid")
+
+    def fit(self, X, y):
+        self.stage1.fit(X, (y == 2).astype(int))
+        mask = y != 2
+        if mask.sum() > 0:
+            self.stage2.fit(X[mask], y[mask])
+        return self
+
+    def predict(self, X):
+        s1  = self.stage1.predict(X)
+        out = np.where(s1 == 1, 2, -1)
+        nh  = out == -1
+        if nh.sum() > 0:
+            out[nh] = self.stage2.predict(X[nh])
+        return out
+
+    def predict_proba_max(self, X):
+        s1_p = self.stage1.predict_proba(X)[:, 1]
+        s2_p = self.stage2.predict_proba(X).max(axis=1)
+        return np.where(self.stage1.predict(X) == 1, s1_p, s2_p)
+
+
+class MultiLabelMITREClassifier:
+    def __init__(self):
+        self.mlb = MultiLabelBinarizer()
+        self.clf = None
+
+    def fit(self, X, y_lists):
+        Y = self.mlb.fit_transform(y_lists)
+        self.clf = OneVsRestClassifier(
+            LinearSVC(class_weight="balanced", max_iter=3000, C=1.0),
+            n_jobs=1)
+        self.clf.fit(X, Y)
+        return self
+
+    def predict(self, X, threshold=0.0):
+        scores = self.clf.decision_function(X)
+        if scores.ndim == 1:
+            scores = scores.reshape(-1, 1)
+        Y_pred = (scores >= threshold).astype(int)
+        no_pred = Y_pred.sum(axis=1) == 0
+        if no_pred.any():
+            for i, idx in zip(np.where(no_pred)[0], scores[no_pred].argmax(axis=1)):
+                Y_pred[i, idx] = 1
+        return self.mlb.inverse_transform(Y_pred)
+
+    def predict_proba_max(self, X):
+        scores = self.clf.decision_function(X)
+        if scores.ndim == 1:
+            scores = scores.reshape(-1, 1)
+        return (1 / (1 + np.exp(-scores))).max(axis=1)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# FLASK APP
+# ─────────────────────────────────────────────────────────────────────────────
+app = Flask(__name__)
 CORS(app, origins=[
     "http://localhost:3000",
     "http://localhost:3001",
-    r"https://.*\.vercel\.app",     # all Vercel preview URLs
-    os.environ.get("FRONTEND_URL", ""),  # explicit production URL if set
+    r"https://.*\.vercel\.app",
+    os.environ.get("FRONTEND_URL", ""),
 ], supports_credentials=False)
 
-# ── Model path — searches multiple locations so it works locally AND on Render ─
+# ── Model path — searches api/ folder first, then repo root ──────────────────
 def _find_model() -> Path:
     candidates = [
-        Path(__file__).parent / "soc_models_v4.pkl",           # api/soc_models_v4.pkl  ← put it here
-        Path(__file__).parent.parent / "soc_models_v4.pkl",    # repo root
-        Path(__file__).parent.parent.parent / "soc_models_v4.pkl",
+        Path(__file__).parent / "soc_models_v4.pkl",
+        Path(__file__).parent.parent / "soc_models_v4.pkl",
         Path(os.environ.get("MODEL_PATH", "soc_models_v4.pkl")),
     ]
     for c in candidates:
         if c.exists():
             return c
-    return candidates[0]  # return first candidate so error message is useful
+    return candidates[0]
 
 MODEL_PKL  = _find_model()
 LOG_CSV    = MODEL_PKL.parent / "prediction_log_v4.csv"
 VT_API_KEY = os.environ.get("VT_API_KEY", "")
 
-# ── Lazy model bundle ──────────────────────────────────────────────────────────
 _bundle   = None
 _load_err = ""
 
-import numpy as np
-import joblib
-import requests as _requests
-
+# ─────────────────────────────────────────────────────────────────────────────
+# DOMAIN CONSTANTS
+# ─────────────────────────────────────────────────────────────────────────────
 PRIORITY_INV = {0: "Low", 1: "Medium", 2: "High"}
 
 HEURISTICS_KEYWORDS = [
@@ -171,7 +271,6 @@ DEFAULT_PLAYBOOK = [
     "Document findings in the incident management platform.",
 ]
 
-
 # ─────────────────────────────────────────────────────────────────────────────
 # HELPERS
 # ─────────────────────────────────────────────────────────────────────────────
@@ -212,8 +311,8 @@ def _vt_lookup_ip(ip, api_key):
         s = a.get("last_analysis_stats", {})
         return {
             "ioc": ip, "type": "ip", "error": None,
-            "status":   "malicious" if s.get("malicious", 0) > 0 else (
-                        "suspicious" if s.get("suspicious", 0) > 0 else "clean"),
+            "status":     "malicious" if s.get("malicious", 0) > 0 else (
+                          "suspicious" if s.get("suspicious", 0) > 0 else "clean"),
             "malicious":  s.get("malicious", 0),
             "suspicious": s.get("suspicious", 0),
             "harmless":   s.get("harmless", 0),
@@ -239,7 +338,6 @@ def _vt_lookup_domain(domain, api_key):
             return {"ioc": domain, "type": "domain", "error": f"HTTP {r.status_code}"}
         a = r.json()["data"]["attributes"]
         s = a.get("last_analysis_stats", {})
-        cats = list(set(a.get("categories", {}).values()))[:4]
         return {
             "ioc": domain, "type": "domain", "error": None,
             "status":    "malicious" if s.get("malicious", 0) > 0 else (
@@ -247,7 +345,7 @@ def _vt_lookup_domain(domain, api_key):
             "malicious":  s.get("malicious", 0),
             "suspicious": s.get("suspicious", 0),
             "harmless":   s.get("harmless", 0),
-            "categories": cats,
+            "categories": list(set(a.get("categories", {}).values()))[:4],
             "reputation": a.get("reputation", 0),
             "registrar":  a.get("registrar", "—"),
             "last_analysis": datetime.utcfromtimestamp(a["last_analysis_date"]).strftime("%Y-%m-%d")
@@ -264,7 +362,7 @@ def _load_models():
     if not MODEL_PKL.exists():
         _load_err = (
             f"Model file not found: {MODEL_PKL}. "
-            f"Run soc_analyst.py to train, then copy soc_models_v4.pkl into the api/ folder."
+            "Run soc_analyst.py to train, then copy soc_models_v4.pkl into the api/ folder."
         )
         return False
     try:
@@ -283,8 +381,8 @@ def _explain(text, enc, model_a, top_n=5):
         base_conf = float(model_a.predict_proba_max(enc.transform([text]))[0])
         imps = []
         for i, tok in enumerate(tokens):
-            ablated = " ".join(t for j, t in enumerate(tokens) if j != i)
-            conf = float(model_a.predict_proba_max(enc.transform([ablated]))[0])
+            ablated  = " ".join(t for j, t in enumerate(tokens) if j != i)
+            conf     = float(model_a.predict_proba_max(enc.transform([ablated]))[0])
             imps.append({"token": tok, "delta": round(base_conf - conf, 4)})
         imps.sort(key=lambda x: -abs(x["delta"]))
         return imps[:top_n]
@@ -305,7 +403,7 @@ def _log_prediction(data):
                 w.writeheader()
             w.writerow(data)
     except Exception:
-        pass  # don't crash the API if logging fails
+        pass
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -315,8 +413,8 @@ def _log_prediction(data):
 @app.route("/")
 def index():
     return jsonify({
-        "service": "Synapse SOC API",
-        "version": "1.0",
+        "service":   "Synapse SOC API",
+        "version":   "2.0",
         "endpoints": ["/api/health", "/api/triage", "/api/stats", "/api/recent"],
     })
 
@@ -357,11 +455,11 @@ def triage():
     m_b = _bundle["model_b"]
 
     # Priority
-    heuristic = _heuristic_priority(ticket_name, description, threat_desc)
-    combined  = f"{ticket_name} {description} {threat_desc}".lower().strip()
-    feat      = enc.transform([combined])
-    ml_pri    = int(m_a.predict(feat)[0])
-    final_pri = max(heuristic if heuristic is not None else ml_pri, ml_pri)
+    heuristic  = _heuristic_priority(ticket_name, description, threat_desc)
+    combined   = f"{ticket_name} {description} {threat_desc}".lower().strip()
+    feat       = enc.transform([combined])
+    ml_pri     = int(m_a.predict(feat)[0])
+    final_pri  = max(heuristic if heuristic is not None else ml_pri, ml_pri)
     confidence = float(m_a.predict_proba_max(feat)[0])
     if heuristic == 2:
         confidence = max(confidence, 0.90)
@@ -397,13 +495,12 @@ def triage():
     }
     if run_vt and vt_key:
         ip_results, domain_results = [], []
-        VT_SLEEP = 15.1
         for ip in iocs["public_ips"][:3]:
             ip_results.append(_vt_lookup_ip(ip, vt_key))
-            time.sleep(VT_SLEEP)
+            time.sleep(15.1)
         for dom in iocs["domains_urls"][:2]:
             domain_results.append(_vt_lookup_domain(dom, vt_key))
-            time.sleep(VT_SLEEP)
+            time.sleep(15.1)
         all_r = ip_results + domain_results
         if not all_r:
             verdict = "NO_IOCS"
@@ -486,13 +583,10 @@ def recent():
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# ENTRY POINT
-# ─────────────────────────────────────────────────────────────────────────────
-
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 5050))   # Render sets PORT automatically
-    print(f"Synapse API starting on http://0.0.0.0:{port}")
-    print(f"Model path: {MODEL_PKL}")
+    port = int(os.environ.get("PORT", 5050))
+    print(f"Synapse API v2 starting on http://0.0.0.0:{port}")
+    print(f"Model path : {MODEL_PKL}")
     print(f"Model found: {MODEL_PKL.exists()}")
     _load_models()
     app.run(host="0.0.0.0", port=port, debug=False)
