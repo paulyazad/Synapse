@@ -156,26 +156,61 @@ _load_err = ""
 # ─────────────────────────────────────────────────────────────────────────────
 PRIORITY_INV = {0: "Low", 1: "Medium", 2: "High"}
 
-HEURISTICS_KEYWORDS = [
-    "ransomware", "encrypted files", "shadow copy", "vssadmin", "wbadmin delete",
-    "encoded powershell", "base64", "invoke-expression", "iex(", "bypass executionpolicy",
-    "mimikatz", "lsass", "pass-the-hash", "pass the hash", "credential dump",
-    "seimpersonateprivilege", "reg save sam",
-    "exfiltration", "data loss", "user downloading huge data",
-    "vm shutdown", "firewall disconnect", "server down", "device disconnect",
-    "unexpected power off", "system halt", "arcsight dropping events",
-    "arcsight connector shutdown",
-    "lateral movement", "domain controller",
-    "admin group modification", "admin role removed", "net localgroup administrators",
-    "certutil -decode", "bitsadmin /transfer", "whoami /priv",
-    "malware beaconing", "malware outbreak", "network sniffing",
-    "sap application server stopped", "sap audit configuration",
-    "critical asset down", "impossible travel", "two different geograph",
-    "authentication failure followed by successful",
-    "account created or deleted using critical service account",
+# ── Precision HIGH heuristics ─────────────────────────────────────────────────
+# Rules are tightened to SPECIFIC multi-word phrases that only appear in genuinely
+# critical events. Single broad words like "base64", "lsass", "lateral movement"
+# are intentionally removed — they appear in routine informational tickets and
+# caused nearly everything to be classified HIGH.
+#
+# Tier 1: Definite operational disruption
+_T1 = [
+    "vm shutdown", "vm has been shutdown", "virtual machine shutdown",
+    "firewall disconnected", "firewall disconnect detected",
+    "fortigate disconnected", "checkpoint disconnected",
+    "server down", "server is down", "server went down",
+    "device disconnected", "device offline",
+    "unexpected power off", "unexpected shutdown",
+    "system halt", "system halted",
+    "arcsight connector shutdown", "arcsight dropping events",
+    "sap application server stopped", "sap server stopped",
+    "critical asset down", "critical service unavailable",
 ]
+# Tier 2: Active ransomware / destructive malware execution
+_T2 = [
+    "shadow copy deleted", "shadow copies deleted", "vssadmin delete shadows",
+    "wbadmin delete catalog",
+    "encoded powershell", "powershell -encodedcommand", "powershell -enc ",
+    "invoke-expression", "iex(new-object", "bypass executionpolicy",
+    "ransomware detected", "files encrypted", "encryption in progress",
+    "malware outbreak", "malware beaconing",
+]
+# Tier 3: Confirmed credential theft tools (specific tool names, not generic words)
+_T3 = [
+    "mimikatz", "pass-the-hash attack", "pass the hash attack",
+    "credential dumping detected", "lsass dumped", "lsass memory dump",
+    "reg save sam", "reg save hklm\\sam",
+    "seimpersonateprivilege exploited",
+]
+# Tier 4: Confirmed exfiltration (not just mention of the word)
+_T4 = [
+    "data exfiltration detected", "data exfiltration confirmed",
+    "large data transfer detected", "user downloading huge data",
+    "exfiltration detected",
+]
+# Tier 5: Specific AD/domain compromise actions (not just "domain controller" mention)
+_T5 = [
+    "domain controller compromised", "dc compromised",
+    "net localgroup administrators add", "added to domain admins",
+    "account created using critical service account",
+    "admin role assigned to", "privilege escalation confirmed",
+    "certutil -decode", "bitsadmin /transfer",
+    "impossible travel detected", "login from two different countries",
+    "authentication failure followed by successful login",
+]
+
+_ALL_PHRASES = _T1 + _T2 + _T3 + _T4 + _T5
 _HIGH_PAT = re.compile(
-    "|".join(re.escape(k) for k in sorted(HEURISTICS_KEYWORDS, key=len, reverse=True)),
+    "|".join(re.escape(p) for p in sorted(_ALL_PHRASES, key=len, reverse=True)),
     re.IGNORECASE,
 )
 
@@ -459,10 +494,21 @@ def triage():
     combined   = f"{ticket_name} {description} {threat_desc}".lower().strip()
     feat       = enc.transform([combined])
     ml_pri     = int(m_a.predict(feat)[0])
-    final_pri  = max(heuristic if heuristic is not None else ml_pri, ml_pri)
     confidence = float(m_a.predict_proba_max(feat)[0])
+
+    # HIGH gate: ML can only assign HIGH if confidence >= 0.75.
+    # Below that threshold, demote to MEDIUM. This prevents the over-trained
+    # SMOTE boundary from weakly classifying ambiguous tickets as HIGH.
+    if ml_pri == 2 and confidence < 0.75:
+        ml_pri = 1  # demote to MEDIUM
+
+    # Heuristic always wins if it fires (rule-based certainty > ML)
     if heuristic == 2:
+        final_pri  = 2
         confidence = max(confidence, 0.90)
+    else:
+        final_pri  = ml_pri
+
     auto_dispatch = confidence >= 0.60
 
     # MITRE
